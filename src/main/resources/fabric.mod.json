@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "vampireroulette",
+  "version": "${version}",
+  "name": "Vampire Roulette",
+  "description": "Roulette game: vampire, old man and normal players.",
+  "authors": [],
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.example.vampire.VampireRoulette"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.1",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
