@@ -7,7 +7,6 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.ChatFormatting;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
-import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
@@ -21,15 +20,14 @@ import java.util.*;
 public class VampireRoulette implements ModInitializer {
 
 	// ===== إعدادات =====
-	static final double BITE_DISTANCE = 3.0;          // اقصى مسافة للعض
+	static final double BITE_DISTANCE = 3.0;           // اقصى مسافة للعض
 	static final boolean REQUIRE_BLOCK_BETWEEN = true; // لازم يكون بينهم بلوكة
-	static final int FREEZE_TICKS = 5 * 20;            // تثبيت العجوز 5 ثواني
-	static final int PROMPT_COOLDOWN = 60;             // كل كم تيك يطلع زر العض لنفس الشخص
+	static final int FREEZE_TICKS = 5 * 20;             // تثبيت العجوز 5 ثواني
 
 	enum Role { NORMAL, VAMPIRE_PENDING, VAMPIRE, OLD_PENDING, OLD }
 
 	static final Map<UUID, Role> ROLES = new HashMap<>();
-	static final Map<String, Integer> PROMPTED = new HashMap<>(); // vampire:target -> tick
+	static final Set<UUID> WAS_SNEAKING = new HashSet<>();
 	static boolean running = false;
 	static int tickCounter = 0;
 
@@ -39,10 +37,19 @@ public class VampireRoulette implements ModInitializer {
 			dispatcher.register(Commands.literal("vampire")
 				.then(Commands.literal("start").requires(Commands.hasPermission(Commands.LEVEL_GAMEMASTERS)).executes(ctx -> start(ctx.getSource())))
 				.then(Commands.literal("stop").requires(Commands.hasPermission(Commands.LEVEL_GAMEMASTERS)).executes(ctx -> stop(ctx.getSource())))
-				.then(Commands.literal("transform").executes(ctx -> transform(ctx.getSource())))
+				.then(Commands.literal("transform").executes(ctx -> {
+					ServerPlayer p = ctx.getSource().getPlayer();
+					return p == null ? 0 : doTransform(p, ctx.getSource().getServer());
+				}))
 				.then(Commands.literal("bite")
 					.then(Commands.argument("target", StringArgumentType.word())
-						.executes(ctx -> bite(ctx.getSource(), StringArgumentType.getString(ctx, "target"))))));
+						.executes(ctx -> {
+							ServerPlayer v = ctx.getSource().getPlayer();
+							if (v == null) return 0;
+							ServerPlayer t = ctx.getSource().getServer().getPlayerList()
+								.getPlayerByName(StringArgumentType.getString(ctx, "target"));
+							return t == null ? 0 : doBite(v, t, ctx.getSource().getServer());
+						}))));
 		});
 
 		ServerTickEvents.END_SERVER_TICK.register(this::onTick);
@@ -58,7 +65,7 @@ public class VampireRoulette implements ModInitializer {
 			return 0;
 		}
 		ROLES.clear();
-		PROMPTED.clear();
+		WAS_SNEAKING.clear();
 		running = true;
 
 		Collections.shuffle(players);
@@ -75,14 +82,10 @@ public class VampireRoulette implements ModInitializer {
 		for (ServerPlayer p : players) {
 			Role r = ROLES.get(p.getUUID());
 			switch (r) {
-				case VAMPIRE_PENDING -> {
-					p.sendSystemMessage(Component.literal("🧛 انت مصاص دماء! (سر) ").withStyle(ChatFormatting.DARK_RED)
-						.append(button("[ تحول ]", "/vampire transform", ChatFormatting.RED)));
-				}
-				case OLD_PENDING -> {
-					p.sendSystemMessage(Component.literal("👴 انت العجوز! (سر) ").withStyle(ChatFormatting.GRAY)
-						.append(button("[ تحول ]", "/vampire transform", ChatFormatting.AQUA)));
-				}
+				case VAMPIRE_PENDING -> p.sendSystemMessage(
+					Component.literal("🧛 انت مصاص دماء! (سر) اضغط Shift عشان تتحول.").withStyle(ChatFormatting.DARK_RED));
+				case OLD_PENDING -> p.sendSystemMessage(
+					Component.literal("👴 انت العجوز! (سر) اضغط Shift عشان تتحول وتثبت الطبيعيين.").withStyle(ChatFormatting.AQUA));
 				default -> p.sendSystemMessage(Component.literal("انت لاعب طبيعي.").withStyle(ChatFormatting.GREEN));
 			}
 		}
@@ -92,21 +95,20 @@ public class VampireRoulette implements ModInitializer {
 	static int stop(CommandSourceStack src) {
 		running = false;
 		ROLES.clear();
-		PROMPTED.clear();
+		WAS_SNEAKING.clear();
 		src.sendSuccess(() -> Component.literal("تم ايقاف الروليت."), true);
 		return 1;
 	}
 
 	// ===== التحول =====
-	static int transform(CommandSourceStack src) {
-		ServerPlayer p = src.getPlayer();
-		if (p == null || !running) return 0;
+	static int doTransform(ServerPlayer p, MinecraftServer server) {
+		if (!running) return 0;
 		Role r = ROLES.get(p.getUUID());
 
 		if (r == Role.VAMPIRE_PENDING) {
 			ROLES.put(p.getUUID(), Role.VAMPIRE);
 			makeVampireEffects(p);
-			p.sendSystemMessage(Component.literal("🧛 تحولت الى مصاص دماء! قرب من لاعب وبينكم بلوكة عشان يطلع لك زر العض.")
+			p.sendSystemMessage(Component.literal("🧛 تحولت الى مصاص دماء! قرب من لاعب وبينكم بلوكة، واضغط Shift عشان تعضه.")
 				.withStyle(ChatFormatting.DARK_RED));
 			return 1;
 		}
@@ -114,7 +116,7 @@ public class VampireRoulette implements ModInitializer {
 		if (r == Role.OLD_PENDING) {
 			ROLES.put(p.getUUID(), Role.OLD);
 			p.sendSystemMessage(Component.literal("👴 تحولت! تم تثبيت الطبيعيين 5 ثواني.").withStyle(ChatFormatting.AQUA));
-			for (ServerPlayer t : src.getServer().getPlayerList().getPlayers()) {
+			for (ServerPlayer t : server.getPlayerList().getPlayers()) {
 				if (ROLES.get(t.getUUID()) == Role.NORMAL) {
 					freeze(t);
 					t.sendSystemMessage(Component.literal("⛔ العجوز ثبتك!").withStyle(ChatFormatting.RED));
@@ -136,19 +138,9 @@ public class VampireRoulette implements ModInitializer {
 	}
 
 	// ===== العض =====
-	static int bite(CommandSourceStack src, String targetName) {
-		ServerPlayer v = src.getPlayer();
-		if (v == null || !running || ROLES.get(v.getUUID()) != Role.VAMPIRE) return 0;
-
-		ServerPlayer t = src.getServer().getPlayerList().getPlayerByName(targetName);
-		if (t == null || ROLES.get(t.getUUID()) != Role.NORMAL) {
-			v.sendSystemMessage(Component.literal("ما تقدر تعضه."));
-			return 0;
-		}
-		if (!canBite(v, t)) {
-			v.sendSystemMessage(Component.literal("بعيد او مو ضمن الشروط."));
-			return 0;
-		}
+	static int doBite(ServerPlayer v, ServerPlayer t, MinecraftServer server) {
+		if (!running || ROLES.get(v.getUUID()) != Role.VAMPIRE) return 0;
+		if (ROLES.get(t.getUUID()) != Role.NORMAL || !canBite(v, t)) return 0;
 
 		ROLES.put(t.getUUID(), Role.VAMPIRE);
 		t.addEffect(new MobEffectInstance(MobEffects.NAUSEA, 200, 0));
@@ -156,12 +148,12 @@ public class VampireRoulette implements ModInitializer {
 		t.addEffect(new MobEffectInstance(MobEffects.WEAKNESS, 100, 0));
 		makeVampireEffects(t);
 		t.sendSystemMessage(Component.literal("🩸 انعضيت! صرت مصاص دماء مع الفريق.").withStyle(ChatFormatting.DARK_RED));
-		v.sendSystemMessage(Component.literal("🧛 عضيت " + t.getGameProfile().name() + " وصار معك!")
+		v.sendSystemMessage(Component.literal("🧛 عضيت " + t.getName().getString() + " وصار معك!")
 			.withStyle(ChatFormatting.RED));
 
 		boolean anyNormal = ROLES.values().stream().anyMatch(r -> r == Role.NORMAL);
 		if (!anyNormal) {
-			src.getServer().getPlayerList().broadcastSystemMessage(
+			server.getPlayerList().broadcastSystemMessage(
 				Component.literal("🧛 انتهت اللعبة! تحول كل الطبيعيين.").withStyle(ChatFormatting.DARK_RED), false);
 			running = false;
 		}
@@ -177,30 +169,46 @@ public class VampireRoulette implements ModInitializer {
 		return v.level().clip(ctx).getType() == HitResult.Type.BLOCK;
 	}
 
-	// ===== التيك: يطلع زر العض =====
+	// ===== كل تيك: نص فوق الاكشن بار + ضغط Shift =====
 	void onTick(MinecraftServer server) {
 		tickCounter++;
-		if (!running || tickCounter % 10 != 0) return;
+		if (!running) return;
 
 		List<ServerPlayer> all = server.getPlayerList().getPlayers();
-		for (ServerPlayer v : all) {
-			if (ROLES.get(v.getUUID()) != Role.VAMPIRE) continue;
-			for (ServerPlayer t : all) {
-				if (ROLES.get(t.getUUID()) != Role.NORMAL) continue;
-				if (!canBite(v, t)) continue;
-				String key = v.getUUID() + ":" + t.getUUID();
-				Integer last = PROMPTED.get(key);
-				if (last != null && tickCounter - last < PROMPT_COOLDOWN) continue;
-				PROMPTED.put(key, tickCounter);
-				String name = t.getGameProfile().name();
-				v.sendSystemMessage(Component.literal("قريب من " + name + " ")
-					.append(button("[ عض ]", "/vampire bite " + name, ChatFormatting.RED)));
+		for (ServerPlayer p : all) {
+			UUID id = p.getUUID();
+			boolean sneaking = p.isShiftKeyDown();
+			boolean pressed = sneaking && !WAS_SNEAKING.contains(id);
+			if (sneaking) WAS_SNEAKING.add(id); else WAS_SNEAKING.remove(id);
+
+			Role r = ROLES.get(id);
+			if (r == null) continue;
+
+			if (r == Role.VAMPIRE_PENDING || r == Role.OLD_PENDING) {
+				if (tickCounter % 10 == 0) {
+					p.displayClientMessage(Component.literal("⬆ اضغط Shift للتحول")
+						.withStyle(r == Role.VAMPIRE_PENDING ? ChatFormatting.RED : ChatFormatting.AQUA), true);
+				}
+				if (pressed) doTransform(p, server);
+				continue;
+			}
+
+			if (r == Role.VAMPIRE) {
+				ServerPlayer target = null;
+				for (ServerPlayer t : all) {
+					if (t == p || ROLES.get(t.getUUID()) != Role.NORMAL) continue;
+					if (canBite(p, t)) { target = t; break; }
+				}
+				if (target == null) continue;
+				if (tickCounter % 10 == 0) {
+					p.displayClientMessage(Component.literal("🧛 اضغط Shift لعض " + target.getName().getString())
+						.withStyle(ChatFormatting.DARK_RED), true);
+				}
+				if (pressed) {
+					doBite(p, target, server);
+					if (!running) return;
+				}
 			}
 		}
-	}
-
-	static Component button(String text, String command, ChatFormatting color) {
-		return Component.literal(text).withStyle(s -> s.withColor(color).withBold(true)
-			.withClickEvent(new ClickEvent.RunCommand(command)));
 	}
 }
